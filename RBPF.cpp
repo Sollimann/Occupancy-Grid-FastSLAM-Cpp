@@ -363,6 +363,19 @@ void RBPF::scan_matching(const Eigen::Vector3f &pose, Sensor& sensor){
 // +++++++++++++++++++++++++++++++++++++++++ Improved Propsosal ++++++++++++++++++++++++++++++++++++++++++++++
 // +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
+
+Eigen::Vector2f mirror_point(Eigen::Vector2f point, Eigen::Vector2f line){
+    
+    float d = (point(0) + (point(1) - line(1)) * line(0)) / (1 + pow(line(0), 2));
+    Eigen::Vector2f mirrored_point;
+    mirrored_point(0) = 2 * d - point(0);
+    mirrored_point(1) = 2 * d * line(0) - point(1) + 2 * line(1);
+    
+    return mirrored_point;
+    
+}
+
+
 double RBPF::motion_model_velocity(Eigen::Vector3f particle_pose, Eigen::Vector3f sample_pose, Eigen::Vector2f odometry_signal, float current_timestamp){
     
     float v = odometry_signal(0);
@@ -371,16 +384,31 @@ double RBPF::motion_model_velocity(Eigen::Vector3f particle_pose, Eigen::Vector3
     // Get sampling time
     float delta_t = current_timestamp - this->last_timestamp;
     
-    float x_t = sample_pose(0);
-    float y_t = sample_pose(1);
-    float t_t = sample_pose(2);
+    float x_t1 = sample_pose(0);
+    float y_t1 = sample_pose(1);
+    float t_t1 = sample_pose(2);
 
-    float x_t1 = particle_pose(0);
-    float y_t1 = particle_pose(1);
-    float t_t1 = particle_pose(2);
+    float x_t = particle_pose(0);
+    float y_t = particle_pose(1);
+    float t_t = particle_pose(2);
     
-    float mu = 0.5 * ((x_t - x_t1) * cos(t_t) + (y_t - y_t1) * sin(t_t1)) /
-    ((y_t - y_t1) * sin(t_t1) - (x_t - x_t1) * cos(t_t));
+    float x_rel = x_t1 - x_t;
+    float y_rel = y_t1 - y_t;
+    float theta_cell = atan2(y_rel, x_rel);
+    if (theta_cell < t_t && (theta_cell + PI) > t_t){
+        Eigen::Vector2f rel_pos;
+        rel_pos(0) = x_rel;
+        rel_pos(1) = y_rel;
+        Eigen::Vector2f line;
+        line(0) = tan(t_t - PI/2);
+        line(1) = 0.0;
+        Eigen::Vector2f h = mirror_point(rel_pos, line);
+        x_t1 = x_t + h(0);
+        y_t1 = y_t + h(1);
+    }
+    
+    float mu = 0.5 * ((x_t - x_t1) * cos(t_t) + (y_t - y_t1) * sin(t_t)) /
+    ((y_t - y_t1) * cos(t_t) - (x_t - x_t1) * sin(t_t));
     
     float x_star = (x_t + x_t1) / 2.0 + mu * (y_t - y_t1);
     float y_star = (y_t + y_t1) / 2.0 + mu * (x_t1 - x_t);
@@ -388,22 +416,22 @@ double RBPF::motion_model_velocity(Eigen::Vector3f particle_pose, Eigen::Vector3
     float r_star = sqrt(pow((x_t-x_star), 2) + pow((y_t-y_star), 2));
     
     float delta_theta = atan2(y_t1 - y_star, x_t1 - x_star) - atan2(y_t - y_star, x_t - x_star);
+    if (delta_theta < -PI/2){
+        delta_theta += 2 * PI;
+    }
     
     float v_hat = delta_theta / delta_t * r_star;
     float omega_hat = delta_theta / delta_t;
     
-    // Create standard normal distribution for sampling
-    normal_distribution<float> distribution(0.0, 1.0);
-    
     Eigen::Vector4f a = Eigen::Vector4f::Zero();
-    a(0) = 0.1;
-    a(1) = 0.02;
-    a(2) = 0.02;
-    a(3) = 0.1;
+    a(0) = 0.0015;
+    a(1) = 0.45;
+    a(2) = 0.75;
+    a(3) = 0.75;
     float std_dev_1 = sqrt(a(0)*pow(v, 2)+a(1)*pow(omega, 2));
-    float p1 = (v - v_hat) + std_dev_1 * distribution(engine);
+    float p1 = exp(-0.5*pow(((v - v_hat)/std_dev_1), 2)) / (sqrt(2*PI) * std_dev_1);
     float std_dev_2 = sqrt(a(2)*pow(v, 2)+a(3)*pow(omega, 2));
-    float p2 = (omega - omega_hat) + std_dev_2 * distribution(engine);
+    float p2 = exp(-0.5*pow(((omega - omega_hat)/std_dev_2), 2)) / (sqrt(2*PI) * std_dev_2);
 
     float p = p1 * p2;
     
@@ -540,6 +568,8 @@ void RBPF::improved_proposal(Sensor &sensor, Eigen::Vector2f odometry_signal, fl
                     valid_ids.push_back(beam_id);
                 }
             }
+            
+            cout << "valid_ids: " << valid_ids.size() << endl;
                     
             // Compute average likelihood of measurements
             double p = 1.0;
@@ -549,20 +579,23 @@ void RBPF::improved_proposal(Sensor &sensor, Eigen::Vector2f odometry_signal, fl
                             
                     // Get difference between real and estimated measurement
                     float scan_dif = abs(measurement_ref(beam_id, 1) - sample_measurement_estimate(beam_id, 1));
+                    float angle_dif = abs(measurement_ref(beam_id, 0) - sample_measurement_estimate(beam_id, 0));
                             
                     // Compute and accumulate likelihood of measurement based on gaussian measurement model
-                    float likelihood = exp(-0.5*pow((scan_dif/sensor.getQ()(1)), 2)) / (sqrt(2*PI) * sensor.getQ()(1));
+                    float likelihood1 = exp(-0.5*pow((scan_dif/0.3), 2)) / (sqrt(2*PI) * 0.3);
+                    //float likelihood2 = exp(-0.5*pow((scan_dif/0.3), 2)) / (sqrt(2*PI) * 0.3);
+                    
                     //float likelihood = exp(-0.5*pow((scan_dif), 2)) / (sqrt(2*PI));
                             
                     // Update likelihood
-                    p *= likelihood;
+                    p *= likelihood1; // * likelihood2;
                 }
             }
             
             // Compute motion model probability of sample
             Eigen::Vector3f last_particle_pose = (*it).getLastPose();
-            //double p1 = motion_model_velocity(last_particle_pose, (*sit), odometry_signal, current_timestamp);
-            //p *= p1;
+            double p1 = motion_model_velocity(last_particle_pose, (*sit), odometry_signal, current_timestamp);
+            p *= p1;
             
             // Update mean estimate and normalization factor
             mu_i += (*sit) * p;
@@ -666,12 +699,15 @@ void RBPF::weight(Sensor &sensor){
                 
                 // Get difference between real and estimated measurement
                 float scan_dif = abs(measurement_ref(beam_id, 1) - measurement_estimate(beam_id, 1));
+                float angle_dif = abs(measurement_ref(beam_id, 0) - measurement_estimate(beam_id, 0));
+
                 
                 // Compute and accumulate likelihood of measurement based on gaussian measurement model
-                float likelihood = exp(-0.5*pow((scan_dif/sensor.getQ()(1)), 2)) / (sqrt(2*PI) * sensor.getQ()(1));
-                
+                float likelihood1 = exp(-0.5*pow((angle_dif/sensor.getQ()(0)), 2)) / (sqrt(2*PI) * sensor.getQ()(0));
+                float likelihood2 = exp(-0.5*pow((scan_dif/sensor.getQ()(1)), 2)) / (sqrt(2*PI) * sensor.getQ()(1));
+
                 // Update likelihood
-                p *= likelihood;
+                p *= likelihood1 * likelihood2;
             }
         }
         
